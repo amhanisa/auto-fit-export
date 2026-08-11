@@ -1,250 +1,674 @@
 /**
  * Auto Fit Export — Adobe Illustrator
  *
- * Requirements:
- * - The .ai file already has Variables + Data Sets
- * - Target text frames are Area Type (not Point Type)
- * - Select one or more text frames BEFORE running the script
+ * Batch-exports all Variable Data Sets from the active artboard.
+ * Optional Auto Fit shrinks Area Type frames selected before running the script.
  *
  * How to use:
- * 1. Open the .ai file
- * 2. Select one or more Area Type frames to auto-fit
+ * 1. Open the .ai file (with Variables + Data Sets)
+ * 2. (Optional) Select Area Type frames to auto-fit
  * 3. File → Scripts → Other Script… → choose this file
- * 4. Pick format (PDF / PNG / JPG), PPI, and output folder
+ * 4. Pick format, folder; enable Auto Fit if frames were selected
+ * 5. Export
  *
  * Output filename = Data Set name (spaces kept; rename workaround after export).
- *
- * Notes:
- * - JPG/PNG: PPI via scale (100% = 72ppi); PNG falls back to ImageCapture if needed
- * - PDF: vector; PPI is unused
- * - maxFontSize per text frame = font size when the script starts
  */
 
 #target illustrator
 
 (function () {
-  var JPG_QUALITY = 100;
   var ARTBOARD_CLIPPING = true;
+  var PREFS_DIR_NAME = "auto-fit-export";
+  var PREFS_FILE_NAME = "prefs.json";
 
-  if (app.documents.length === 0) {
-    alert("No document is open.");
-    return;
-  }
+  var DEFAULTS = {
+    format: "PNG",
+    exportFolder: "",
+    jpgPpi: 300,
+    jpgQuality: 100,
+    pngPpi: 300,
+    pngTransparency: true,
+    pdfPreset: "",
+    autoFit: true
+  };
 
-  var doc = app.activeDocument;
+  var doc = null;
+  var fitTargets = [];
 
-  if (!doc.dataSets || doc.dataSets.length === 0) {
-    alert("This document has no Data Sets.\nImport Variables + Data Sets first.");
-    return;
-  }
+  // -------------------------------------------------------------------------
+  // Prefs
+  // -------------------------------------------------------------------------
 
-  var sel = app.selection;
-  if (!sel || sel.length < 1) {
-    alert("Select at least 1 Area Type before running the script.");
-    return;
-  }
-
-  var targets = [];
-  for (var s = 0; s < sel.length; s++) {
-    var selected = sel[s];
-    if (!isTextFrame(selected) || selected.kind !== TextType.AREATEXT) {
-      continue;
+  function getPrefsFolder() {
+    var folder = new Folder(Folder.userData.fsName + "/" + PREFS_DIR_NAME);
+    if (!folder.exists) {
+      folder.create();
     }
-
-    var markerName = selected.name;
-    if (!markerName || markerName === "<Text>") {
-      markerName = "__export_target_" + s + "__";
-      selected.name = markerName;
-    }
-
-    var maxFontSize = getFontSize(selected);
-    if (!maxFontSize || maxFontSize <= 0) {
-      alert(
-        "Could not read the text frame font size.\nReselect the Area Type frames, then run the script again."
-      );
-      return;
-    }
-
-    targets.push({
-      markerName: markerName,
-      maxFontSize: maxFontSize
-    });
+    return folder;
   }
 
-  if (targets.length === 0) {
-    alert(
-      "No Area Type frames in the selection.\nSelect one or more Area Type frames (not Point Type)."
-    );
-    return;
+  function getPrefsFile() {
+    return new File(getPrefsFolder().fsName + "/" + PREFS_FILE_NAME);
   }
 
-  var exportOpts = showExportDialog();
-  if (!exportOpts) {
-    return;
+  function escapeJsonString(str) {
+    return String(str)
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\r/g, "\\r")
+      .replace(/\n/g, "\\n")
+      .replace(/\t/g, "\\t");
   }
 
-  if (exportOpts.pdf && (!doc.fullName || !doc.saved)) {
-    alert("To export PDF, save the .ai file first (File → Save).");
-    return;
-  }
-
-  var outFolder = Folder.selectDialog("Choose output folder");
-  if (!outFolder) {
-    return;
-  }
-
-  var sourceAiFile = null;
-  try {
-    if (doc.fullName) {
-      sourceAiFile = doc.fullName;
-    }
-  } catch (e) {}
-
-  var scalePct = (exportOpts.ppi / 72) * 100;
-  var exported = 0;
-  var usedNames = {};
-
-  for (var i = 0; i < doc.dataSets.length; i++) {
-    var ds = doc.dataSets[i];
-    ds.display();
-    app.redraw();
-
-    for (var t = 0; t < targets.length; t++) {
-      var frame = findTextFrameByName(doc, targets[t].markerName);
-      if (!frame) {
-        alert(
-          "Target text frame missing after displaying Data Set:\n" +
-            ds.name +
-            "\n(" +
-            targets[t].markerName +
-            ")"
-        );
-        return;
+  function loadPrefs() {
+    var out = {};
+    var key;
+    for (key in DEFAULTS) {
+      if (DEFAULTS.hasOwnProperty(key)) {
+        out[key] = DEFAULTS[key];
       }
-      fitTextToFrame(frame, targets[t].maxFontSize);
     }
 
-    var baseName = sanitizeFileName(ds.name) || "export_" + (i + 1);
-    baseName = uniqueBaseName(baseName, usedNames);
+    var file = getPrefsFile();
+    if (!file.exists) {
+      return out;
+    }
 
-    if (exportOpts.jpg) {
-      exportJpg(doc, outFolder, baseName, scalePct);
-      exported++;
-    }
-    if (exportOpts.png) {
-      exportPng(doc, outFolder, baseName, exportOpts.ppi);
-      exported++;
-    }
-    if (exportOpts.pdf) {
-      exportPdf(doc, outFolder, baseName);
-      exported++;
-    }
-  }
-
-  // Restore each target to its original design font size
-  for (var r = 0; r < targets.length; r++) {
-    var restoreFrame = findTextFrameByName(doc, targets[r].markerName);
-    if (restoreFrame) {
-      setFontSize(restoreFrame, targets[r].maxFontSize);
-    }
-  }
-
-  // After PDF saveAs, the document may become a .pdf — reopen the original .ai
-  if (exportOpts.pdf && sourceAiFile && sourceAiFile.exists) {
     try {
-      if (!doc.fullName || String(doc.fullName.fsName) !== String(sourceAiFile.fsName)) {
-        doc.close(SaveOptions.DONOTSAVECHANGES);
-        app.open(sourceAiFile);
+      file.encoding = "UTF-8";
+      file.open("r");
+      var raw = file.read();
+      file.close();
+
+      var parsed = parseSimpleJson(raw);
+      if (parsed) {
+        for (key in parsed) {
+          if (parsed.hasOwnProperty(key) && DEFAULTS.hasOwnProperty(key)) {
+            out[key] = parsed[key];
+          }
+        }
       }
-    } catch (reopenErr) {}
+    } catch (e) {}
+
+    return out;
   }
 
-  var formats = [];
-  if (exportOpts.jpg) formats.push("JPG");
-  if (exportOpts.png) formats.push("PNG");
-  if (exportOpts.pdf) formats.push("PDF");
+  function savePrefs(settingsObj) {
+    try {
+      var file = getPrefsFile();
+      file.encoding = "UTF-8";
+      file.open("w");
+      file.write(stringifyPrefs(settingsObj));
+      file.close();
+    } catch (e) {}
+  }
 
-  alert(
-    "Done.\nFiles: " +
-      doc.dataSets.length +
-      " dataset(s)\nText frames: " +
-      targets.length +
-      "\nFormat: " +
-      formats.join(", ") +
-      (exportOpts.jpg || exportOpts.png
-        ? "\nPPI: " + exportOpts.ppi
-        : "") +
-      "\nFolder: " +
-      outFolder.fsName
-  );
+  function stringifyPrefs(settingsObj) {
+    var parts = [];
+    parts.push('"format":"' + escapeJsonString(settingsObj.format) + '"');
+    parts.push('"exportFolder":"' + escapeJsonString(settingsObj.exportFolder) + '"');
+    parts.push('"jpgPpi":' + Number(settingsObj.jpgPpi));
+    parts.push('"jpgQuality":' + Number(settingsObj.jpgQuality));
+    parts.push('"pngPpi":' + Number(settingsObj.pngPpi));
+    parts.push('"pngTransparency":' + (settingsObj.pngTransparency ? "true" : "false"));
+    parts.push('"pdfPreset":"' + escapeJsonString(settingsObj.pdfPreset) + '"');
+    parts.push('"autoFit":' + (settingsObj.autoFit ? "true" : "false"));
+    return "{" + parts.join(",") + "}";
+  }
 
-  // --- Dialog ---
-
-  function showExportDialog() {
-    var w = new Window("dialog", "Auto Fit Export");
-    w.orientation = "column";
-    w.alignChildren = ["fill", "top"];
-    w.margins = 16;
-    w.spacing = 12;
-
-    w.add("statictext", undefined, "Export format:");
-
-    var formatGroup = w.add("group");
-    formatGroup.orientation = "row";
-    formatGroup.alignChildren = ["left", "center"];
-    var cbJpg = formatGroup.add("checkbox", undefined, "JPG");
-    var cbPng = formatGroup.add("checkbox", undefined, "PNG");
-    var cbPdf = formatGroup.add("checkbox", undefined, "PDF");
-    cbJpg.value = true;
-
-    var ppiPanel = w.add("group");
-    ppiPanel.orientation = "row";
-    ppiPanel.alignChildren = ["left", "center"];
-    ppiPanel.add("statictext", undefined, "PPI (JPG/PNG):");
-    var ppiInput = ppiPanel.add("edittext", undefined, "300");
-    ppiInput.characters = 6;
-
-    function syncPpiEnabled() {
-      ppiPanel.enabled = cbJpg.value || cbPng.value;
+  function parseSimpleJson(raw) {
+    if (!raw || typeof raw !== "string") {
+      return null;
     }
-    cbJpg.onClick = syncPpiEnabled;
-    cbPng.onClick = syncPpiEnabled;
-    cbPdf.onClick = syncPpiEnabled;
-    syncPpiEnabled();
-
-    var btns = w.add("group");
-    btns.alignment = "center";
-    btns.add("button", undefined, "OK", { name: "ok" });
-    btns.add("button", undefined, "Cancel", { name: "cancel" });
-
-    if (w.show() !== 1) {
+    raw = raw.replace(/^\s+|\s+$/g, "");
+    if (raw.charAt(0) !== "{" || raw.charAt(raw.length - 1) !== "}") {
       return null;
     }
 
-    if (!cbJpg.value && !cbPng.value && !cbPdf.value) {
-      alert("Select at least 1 format.");
-      return showExportDialog();
+    var result = {};
+    var body = raw.substring(1, raw.length - 1);
+    var i = 0;
+    var len = body.length;
+
+    function skipWs() {
+      while (
+        i < len &&
+        (body.charAt(i) === " " ||
+          body.charAt(i) === "\n" ||
+          body.charAt(i) === "\r" ||
+          body.charAt(i) === "\t")
+      ) {
+        i++;
+      }
     }
 
-    var ppi = parseFloat(ppiInput.text);
-    if (isNaN(ppi) || ppi <= 0) {
-      ppi = 300;
+    function parseString() {
+      if (body.charAt(i) !== '"') {
+        return null;
+      }
+      i++;
+      var outStr = "";
+      while (i < len) {
+        var ch = body.charAt(i);
+        if (ch === "\\") {
+          i++;
+          if (i >= len) {
+            break;
+          }
+          var esc = body.charAt(i);
+          if (esc === "n") {
+            outStr += "\n";
+          } else if (esc === "r") {
+            outStr += "\r";
+          } else if (esc === "t") {
+            outStr += "\t";
+          } else {
+            outStr += esc;
+          }
+        } else if (ch === '"') {
+          i++;
+          return outStr;
+        } else {
+          outStr += ch;
+        }
+        i++;
+      }
+      return null;
     }
 
-    return {
-      jpg: cbJpg.value,
-      png: cbPng.value,
-      pdf: cbPdf.value,
-      ppi: ppi
-    };
+    function parseValue() {
+      skipWs();
+      if (i >= len) {
+        return null;
+      }
+      var ch = body.charAt(i);
+      if (ch === '"') {
+        return parseString();
+      }
+      if (body.substring(i, i + 4) === "true") {
+        i += 4;
+        return true;
+      }
+      if (body.substring(i, i + 5) === "false") {
+        i += 5;
+        return false;
+      }
+      var numStr = "";
+      while (i < len) {
+        var c = body.charAt(i);
+        if ((c >= "0" && c <= "9") || c === "." || c === "-") {
+          numStr += c;
+          i++;
+        } else {
+          break;
+        }
+      }
+      if (numStr.length) {
+        return Number(numStr);
+      }
+      return null;
+    }
+
+    while (i < len) {
+      skipWs();
+      if (i >= len) {
+        break;
+      }
+      var key = parseString();
+      if (key === null) {
+        break;
+      }
+      skipWs();
+      if (body.charAt(i) !== ":") {
+        break;
+      }
+      i++;
+      var value = parseValue();
+      if (value !== null && value !== undefined) {
+        result[key] = value;
+      }
+      skipWs();
+      if (body.charAt(i) === ",") {
+        i++;
+      }
+    }
+
+    return result;
   }
 
-  // --- Export ---
+  // -------------------------------------------------------------------------
+  // Selection snapshot (at script start)
+  // -------------------------------------------------------------------------
+
+  function isTextFrame(item) {
+    try {
+      return item && item.typename === "TextFrame";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function isAreaTextFrame(item) {
+    try {
+      if (!isTextFrame(item)) {
+        return false;
+      }
+      if (item.kind === TextType.AREATEXT) {
+        return true;
+      }
+      // Some engines compare enums unreliably
+      return String(item.kind).indexOf("AREATEXT") >= 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function collectAreaFramesFromItem(item, out) {
+    if (!item) {
+      return;
+    }
+    try {
+      if (isAreaTextFrame(item)) {
+        out.push(item);
+        return;
+      }
+      if (item.typename === "GroupItem" && item.pageItems && item.pageItems.length) {
+        var g;
+        for (g = 0; g < item.pageItems.length; g++) {
+          collectAreaFramesFromItem(item.pageItems[g], out);
+        }
+      }
+    } catch (e) {}
+  }
 
   /**
-   * Illustrator often turns spaces in filenames into "-" on export/save.
-   * Workaround: write a temp file (no spaces), then rename to the Data Set name.
+   * Capture Area Type targets from the current selection BEFORE the dialog opens.
+   * Stores markerName + design maxFontSize (same approach as the original script).
    */
+  function snapshotFitTargets(document) {
+    var frames = [];
+    var sel = null;
+    var i;
+
+    try {
+      sel = document.selection;
+    } catch (eSel) {
+      sel = app.selection;
+    }
+
+    if (sel && sel.length) {
+      for (i = 0; i < sel.length; i++) {
+        collectAreaFramesFromItem(sel[i], frames);
+      }
+    }
+
+    // Deduplicate by object reference
+    var unique = [];
+    var u;
+    var v;
+    var dup;
+    for (u = 0; u < frames.length; u++) {
+      dup = false;
+      for (v = 0; v < unique.length; v++) {
+        if (unique[v] === frames[u]) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) {
+        unique.push(frames[u]);
+      }
+    }
+    frames = unique;
+
+    var targets = [];
+    var usedMarkers = {};
+    var stamp = new Date().getTime();
+
+    for (i = 0; i < frames.length; i++) {
+      var frame = frames[i];
+      var markerName = frame.name;
+
+      // Ensure a stable, unique name so we can find the frame after Data Set display()
+      if (
+        !markerName ||
+        markerName === "<Text>" ||
+        usedMarkers[markerName]
+      ) {
+        markerName = "__af_export_" + stamp + "_" + i + "__";
+        try {
+          frame.name = markerName;
+        } catch (eName) {
+          continue;
+        }
+      }
+      usedMarkers[markerName] = true;
+
+      var maxFontSize = getFontSize(frame);
+      if (!maxFontSize || maxFontSize <= 0) {
+        try {
+          if (frame.characters && frame.characters.length > 0) {
+            maxFontSize = frame.characters[0].characterAttributes.size;
+          }
+        } catch (eChar) {}
+      }
+      if (!maxFontSize || maxFontSize <= 0) {
+        continue;
+      }
+
+      targets.push({
+        markerName: markerName,
+        maxFontSize: maxFontSize
+      });
+    }
+
+    return targets;
+  }
+
+  // -------------------------------------------------------------------------
+  // Dialog
+  // -------------------------------------------------------------------------
+
+  function getPdfPresetNames() {
+    var names = [];
+    try {
+      var list = app.PDFPresetsList;
+      if (list && list.length) {
+        var i;
+        for (i = 0; i < list.length; i++) {
+          names.push(String(list[i]));
+        }
+      }
+    } catch (e) {}
+    return names;
+  }
+
+  function pickDefaultPdfPreset(names, savedName) {
+    var i;
+    var p;
+    if (savedName) {
+      for (i = 0; i < names.length; i++) {
+        if (names[i] === savedName) {
+          return savedName;
+        }
+      }
+    }
+    var preferred = ["[Press Quality]", "[High Quality Print]", "[Illustrator Default]"];
+    for (p = 0; p < preferred.length; p++) {
+      for (i = 0; i < names.length; i++) {
+        if (names[i] === preferred[p]) {
+          return preferred[p];
+        }
+      }
+    }
+    return names.length ? names[0] : "";
+  }
+
+  function clampInt(value, min, max, fallback) {
+    var n = parseInt(value, 10);
+    if (isNaN(n)) {
+      return fallback;
+    }
+    if (n < min) {
+      return min;
+    }
+    if (n > max) {
+      return max;
+    }
+    return n;
+  }
+
+  function getActiveArtboardIndex1Based(document) {
+    try {
+      return document.artboards.getActiveArtboardIndex() + 1;
+    } catch (e) {
+      return 1;
+    }
+  }
+
+  function showDialog(savedPrefs, areaCount) {
+    var pdfPresets = getPdfPresetNames();
+    var defaultPdf = pickDefaultPdfPreset(pdfPresets, savedPrefs.pdfPreset);
+    var canAutoFit = areaCount > 0;
+
+    var w = new Window("dialog", "Auto Fit Export");
+    w.orientation = "column";
+    w.alignChildren = ["fill", "top"];
+    w.spacing = 10;
+    w.margins = 16;
+
+    var formatGroup = w.add("panel", undefined, "Format");
+    formatGroup.orientation = "row";
+    formatGroup.alignChildren = ["left", "center"];
+    formatGroup.margins = 12;
+    var radioJpg = formatGroup.add("radiobutton", undefined, "JPG");
+    var radioPng = formatGroup.add("radiobutton", undefined, "PNG");
+    var radioPdf = formatGroup.add("radiobutton", undefined, "PDF");
+
+    if (savedPrefs.format === "JPG") {
+      radioJpg.value = true;
+    } else if (savedPrefs.format === "PDF") {
+      radioPdf.value = true;
+    } else {
+      radioPng.value = true;
+    }
+
+    var folderGroup = w.add("panel", undefined, "Export folder");
+    folderGroup.orientation = "row";
+    folderGroup.alignChildren = ["fill", "center"];
+    folderGroup.margins = 12;
+    var folderInput = folderGroup.add("edittext", undefined, "");
+    folderInput.preferredSize = [320, 24];
+    var browseBtn = folderGroup.add("button", undefined, "Browse…");
+
+    if (savedPrefs.exportFolder) {
+      var savedFolder = new Folder(savedPrefs.exportFolder);
+      if (savedFolder.exists) {
+        folderInput.text = savedFolder.fsName;
+      }
+    }
+
+    browseBtn.onClick = function () {
+      var start = folderInput.text ? new Folder(folderInput.text) : Folder.desktop;
+      var picked = start.selectDlg("Select export folder");
+      if (picked) {
+        folderInput.text = picked.fsName;
+      }
+    };
+
+    var settingsPanel = w.add("panel", undefined, "Settings");
+    settingsPanel.orientation = "stack";
+    settingsPanel.alignChildren = ["fill", "top"];
+    settingsPanel.margins = 12;
+    settingsPanel.preferredSize = [380, 90];
+
+    var jpgPanel = settingsPanel.add("group");
+    jpgPanel.orientation = "column";
+    jpgPanel.alignChildren = ["left", "center"];
+    var jpgRow1 = jpgPanel.add("group");
+    jpgRow1.add("statictext", undefined, "PPI:");
+    var jpgPpiInput = jpgRow1.add("edittext", undefined, String(savedPrefs.jpgPpi || 300));
+    jpgPpiInput.characters = 6;
+    var jpgRow2 = jpgPanel.add("group");
+    jpgRow2.add("statictext", undefined, "Quality (0–100):");
+    var jpgQualityInput = jpgRow2.add(
+      "edittext",
+      undefined,
+      String(savedPrefs.jpgQuality != null ? savedPrefs.jpgQuality : 100)
+    );
+    jpgQualityInput.characters = 6;
+
+    var pngPanel = settingsPanel.add("group");
+    pngPanel.orientation = "column";
+    pngPanel.alignChildren = ["left", "center"];
+    var pngRow1 = pngPanel.add("group");
+    pngRow1.add("statictext", undefined, "PPI:");
+    var pngPpiInput = pngRow1.add("edittext", undefined, String(savedPrefs.pngPpi || 300));
+    pngPpiInput.characters = 6;
+    var pngTransparency = pngPanel.add("checkbox", undefined, "Transparency");
+    pngTransparency.value = savedPrefs.pngTransparency !== false;
+
+    var pdfPanel = settingsPanel.add("group");
+    pdfPanel.orientation = "column";
+    pdfPanel.alignChildren = ["fill", "center"];
+    var pdfRow = pdfPanel.add("group");
+    pdfRow.orientation = "row";
+    pdfRow.alignChildren = ["left", "center"];
+    pdfRow.add("statictext", undefined, "PDF Preset:");
+    var pdfPresetDropdown = pdfRow.add(
+      "dropdownlist",
+      undefined,
+      pdfPresets.length ? pdfPresets : ["(no presets)"]
+    );
+    pdfPresetDropdown.preferredSize = [240, 24];
+    if (pdfPresets.length) {
+      var di;
+      for (di = 0; di < pdfPresetDropdown.items.length; di++) {
+        if (pdfPresetDropdown.items[di].text === defaultPdf) {
+          pdfPresetDropdown.selection = di;
+          break;
+        }
+      }
+      if (!pdfPresetDropdown.selection) {
+        pdfPresetDropdown.selection = 0;
+      }
+    } else {
+      pdfPresetDropdown.selection = 0;
+      pdfPresetDropdown.enabled = false;
+    }
+
+    function updatePanels() {
+      jpgPanel.visible = radioJpg.value;
+      pngPanel.visible = radioPng.value;
+      pdfPanel.visible = radioPdf.value;
+    }
+
+    radioJpg.onClick = updatePanels;
+    radioPng.onClick = updatePanels;
+    radioPdf.onClick = updatePanels;
+    updatePanels();
+
+    var autoFitPanel = w.add("panel", undefined, "Auto Fit");
+    autoFitPanel.orientation = "column";
+    autoFitPanel.alignChildren = ["left", "center"];
+    autoFitPanel.margins = 12;
+
+    autoFitPanel.add(
+      "statictext",
+      undefined,
+      "Area Type selected: " + areaCount
+    );
+
+    var autoFitCb = autoFitPanel.add(
+      "checkbox",
+      undefined,
+      "Auto Fit selected Area Type frames"
+    );
+
+    if (canAutoFit) {
+      autoFitCb.enabled = true;
+      // Always default ON when frames were selected (ignore stale prefs:false)
+      autoFitCb.value = true;
+    } else {
+      autoFitCb.enabled = false;
+      autoFitCb.value = false;
+    }
+
+    var hint = autoFitPanel.add(
+      "statictext",
+      undefined,
+      canAutoFit
+        ? "Using the selection made before running this script."
+        : "Select Area Type frames first, then run the script again to enable Auto Fit."
+    );
+    try {
+      hint.graphics.font = ScriptUI.newFont(
+        hint.graphics.font.name,
+        ScriptUI.FontStyle.ITALIC,
+        10
+      );
+    } catch (eHint) {}
+
+    var info = w.add(
+      "statictext",
+      undefined,
+      "Data Sets: " + doc.dataSets.length + "  |  Active artboard only  |  Clip to artboard"
+    );
+    try {
+      info.graphics.font = ScriptUI.newFont(
+        info.graphics.font.name,
+        ScriptUI.FontStyle.ITALIC,
+        10
+      );
+    } catch (eFont) {}
+
+    var btnGroup = w.add("group");
+    btnGroup.alignment = "right";
+    var cancelBtn = btnGroup.add("button", undefined, "Cancel", { name: "cancel" });
+    var exportBtn = btnGroup.add("button", undefined, "Export", { name: "ok" });
+
+    // Capture UI values on Export click — more reliable than reading after close
+    var result = null;
+
+    exportBtn.onClick = function () {
+      var format = "PNG";
+      if (radioJpg.value) {
+        format = "JPG";
+      } else if (radioPdf.value) {
+        format = "PDF";
+      }
+
+      var folderPath = folderInput.text.replace(/^\s+|\s+$/g, "");
+      if (!folderPath) {
+        alert("Please select an export folder first.");
+        return;
+      }
+
+      var outFolder = new Folder(folderPath);
+      if (!outFolder.exists) {
+        alert("Export folder not found:\n" + folderPath);
+        return;
+      }
+
+      var pdfPreset =
+        pdfPresets.length && pdfPresetDropdown.selection
+          ? pdfPresetDropdown.selection.text
+          : "";
+
+      if (format === "PDF" && !pdfPreset) {
+        alert("No PDF Preset is available in Illustrator.");
+        return;
+      }
+
+      result = {
+        format: format,
+        exportFolder: outFolder.fsName,
+        jpgPpi: clampInt(jpgPpiInput.text, 72, 2400, 300),
+        jpgQuality: clampInt(jpgQualityInput.text, 0, 100, 100),
+        pngPpi: clampInt(pngPpiInput.text, 72, 2400, 300),
+        pngTransparency: !!pngTransparency.value,
+        pdfPreset: pdfPreset,
+        autoFit: canAutoFit && !!autoFitCb.value
+      };
+
+      w.close(1);
+    };
+
+    cancelBtn.onClick = function () {
+      w.close(2);
+    };
+
+    if (w.show() !== 1 || !result) {
+      return null;
+    }
+
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Export
+  // -------------------------------------------------------------------------
+
   function exportWithFinalName(folder, baseName, ext, writer) {
     var finalName = baseName + "." + ext;
     var tempName = "__ai_export_tmp__." + ext;
@@ -260,22 +684,20 @@
 
     writer(tempFile);
 
-    // AI sometimes writes a slightly different name; ensure temp exists
     if (!tempFile.exists) {
       tempFile = new File(folder.fsName + "/" + tempName);
     }
 
     if (tempFile.exists) {
-      if (!tempFile.rename(finalName)) {
-        // rename failed: keep temp (better to have a file than lose it)
-      }
+      tempFile.rename(finalName);
     }
   }
 
-  function exportJpg(document, folder, baseName, scale) {
+  function exportJpg(document, folder, baseName, ppi, quality) {
+    var scale = (ppi / 72) * 100;
     var opts = new ExportOptionsJPEG();
     opts.antiAliasing = true;
-    opts.qualitySetting = JPG_QUALITY;
+    opts.qualitySetting = quality;
     opts.horizontalScale = scale;
     opts.verticalScale = scale;
     opts.optimization = true;
@@ -286,11 +708,11 @@
     });
   }
 
-  function exportPng(document, folder, baseName, ppi) {
+  function exportPng(document, folder, baseName, ppi, transparency) {
     var scale = (ppi / 72) * 100;
     var pngOpts = new ExportOptionsPNG24();
     pngOpts.antiAliasing = true;
-    pngOpts.transparency = false;
+    pngOpts.transparency = transparency;
     pngOpts.artBoardClipping = ARTBOARD_CLIPPING;
     pngOpts.horizontalScale = scale;
     pngOpts.verticalScale = scale;
@@ -304,34 +726,156 @@
         var opts = new ImageCaptureOptions();
         opts.resolution = ppi;
         opts.antiAliasing = true;
-        opts.transparency = false;
-        opts.matte = true;
+        opts.transparency = transparency;
+        opts.matte = !transparency;
         document.imageCapture(tempFile, rect, opts);
       }
     });
   }
 
-  function exportPdf(document, folder, baseName) {
-    var opts = new PDFSaveOptions();
-    opts.compatibility = PDFCompatibility.ACROBAT5;
-    opts.preserveEditability = false;
-    opts.generateThumbnails = true;
-    opts.optimization = true;
-
-    exportWithFinalName(folder, baseName, "pdf", function (tempFile) {
-      document.saveAs(tempFile, opts);
-    });
-  }
-
-  // --- Helpers ---
-
-  function isTextFrame(item) {
+  function exportPdfViaDuplicate(sourceDoc, file, pdfPresetName, artboardIndex1Based) {
+    var duplicate = sourceDoc.duplicate();
     try {
-      return item && item.typename === "TextFrame";
-    } catch (e) {
-      return false;
+      try {
+        duplicate.artboards.setActiveArtboardIndex(artboardIndex1Based - 1);
+      } catch (e1) {}
+
+      var pdfOptions = new PDFSaveOptions();
+      pdfOptions.pDFPreset = pdfPresetName;
+      try {
+        pdfOptions.artboardRange = String(artboardIndex1Based);
+      } catch (e2) {}
+
+      duplicate.saveAs(file, pdfOptions);
+    } finally {
+      try {
+        duplicate.close(SaveOptions.DONOTSAVECHANGES);
+      } catch (e3) {}
     }
   }
+
+  function runExport(settings, targets) {
+    var activeDoc = app.activeDocument;
+    var outFolder = new Folder(settings.exportFolder);
+    var total = activeDoc.dataSets.length;
+    var success = 0;
+    var failed = [];
+    var usedNames = {};
+    var doFit = settings.autoFit && targets && targets.length > 0;
+
+    var previousActiveIndex = -1;
+    try {
+      var ai;
+      for (ai = 0; ai < activeDoc.dataSets.length; ai++) {
+        if (activeDoc.activeDataSet && activeDoc.dataSets[ai] === activeDoc.activeDataSet) {
+          previousActiveIndex = ai;
+          break;
+        }
+      }
+    } catch (e) {
+      previousActiveIndex = -1;
+    }
+
+    var activeAb = getActiveArtboardIndex1Based(activeDoc);
+    var i;
+    var t;
+
+    for (i = 0; i < total; i++) {
+      var dataSet = activeDoc.dataSets[i];
+      var baseName = sanitizeFileName(dataSet.name) || "export_" + (i + 1);
+      baseName = uniqueBaseName(baseName, usedNames);
+
+      try {
+        dataSet.display();
+        app.redraw();
+
+        if (doFit) {
+          for (t = 0; t < targets.length; t++) {
+            var frame = findTextFrameByName(activeDoc, targets[t].markerName);
+            if (!frame) {
+              throw new Error("Target text frame missing: " + targets[t].markerName);
+            }
+            fitTextToFrame(frame, targets[t].maxFontSize);
+          }
+          app.redraw();
+        }
+
+        if (settings.format === "JPG") {
+          exportJpg(
+            activeDoc,
+            outFolder,
+            baseName,
+            settings.jpgPpi,
+            settings.jpgQuality
+          );
+        } else if (settings.format === "PNG") {
+          exportPng(
+            activeDoc,
+            outFolder,
+            baseName,
+            settings.pngPpi,
+            settings.pngTransparency
+          );
+        } else {
+          exportWithFinalName(outFolder, baseName, "pdf", function (tempFile) {
+            exportPdfViaDuplicate(
+              activeDoc,
+              tempFile,
+              settings.pdfPreset,
+              activeAb
+            );
+          });
+        }
+
+        success++;
+      } catch (err) {
+        failed.push(dataSet.name + ": " + err);
+      }
+    }
+
+    if (doFit) {
+      for (t = 0; t < targets.length; t++) {
+        var restoreFrame = findTextFrameByName(activeDoc, targets[t].markerName);
+        if (restoreFrame) {
+          setFontSize(restoreFrame, targets[t].maxFontSize);
+        }
+      }
+    }
+
+    if (previousActiveIndex >= 0 && previousActiveIndex < activeDoc.dataSets.length) {
+      try {
+        activeDoc.dataSets[previousActiveIndex].display();
+        app.redraw();
+      } catch (eRestore) {}
+    }
+
+    savePrefs(settings);
+
+    var msg = "Done.\n\nSucceeded: " + success + " / " + total;
+    if (doFit) {
+      msg += "\nAuto Fit frames: " + targets.length;
+    } else {
+      msg += "\nAuto Fit: off";
+    }
+    msg += "\nFormat: " + settings.format;
+    if (settings.format === "JPG") {
+      msg += "\nPPI: " + settings.jpgPpi;
+    } else if (settings.format === "PNG") {
+      msg += "\nPPI: " + settings.pngPpi;
+    }
+    if (failed.length) {
+      msg += "\nFailed: " + failed.length + "\n\n" + failed.slice(0, 8).join("\n");
+      if (failed.length > 8) {
+        msg += "\n…";
+      }
+    }
+    msg += "\n\nFolder:\n" + outFolder.fsName;
+    alert(msg);
+  }
+
+  // -------------------------------------------------------------------------
+  // Fit helpers
+  // -------------------------------------------------------------------------
 
   function findTextFrameByName(document, name) {
     var frames = document.textFrames;
@@ -357,7 +901,6 @@
       return;
     } catch (e0) {}
 
-    // Fallback only if whole-range set failed
     try {
       var chars = textFrame.characters;
       var n = chars.length;
@@ -386,7 +929,7 @@
   }
 
   function getEffectiveFrameWidth(textFrame) {
-    var b = textFrame.geometricBounds; // [L, T, R, B]
+    var b = textFrame.geometricBounds;
     var w = b[2] - b[0];
     try {
       var pa = textFrame.paragraphs[0].paragraphAttributes;
@@ -400,11 +943,6 @@
     return w;
   }
 
-  /**
-   * True if area text wraps past 1 line or characters are clipped (overflow).
-   * Important for punctuation cases: "..., Sp.O.T." often clips even when
-   * width measurement looks loose.
-   */
   function hasClippedOrWrapped(textFrame) {
     var full = normalizeText(textFrame.contents);
     if (!full.length) {
@@ -433,7 +971,6 @@
     try {
       var lineCharCount = textFrame.lines[0].characters.length;
       var totalCharCount = textFrame.characters.length;
-      // trailing hard return in area text is not counted as content
       var raw = String(textFrame.contents || "").replace(/\r+$/, "");
       if (lineCharCount < raw.length || lineCharCount < totalCharCount - 1) {
         if (normalizeText(textFrame.lines[0].contents) !== full) {
@@ -448,10 +985,6 @@
     return false;
   }
 
-  /**
-   * Measure rendered single-line width. Prefer duplicate + convert to point text
-   * so font/kerning match the original frame.
-   */
   function measureTextWidth(textFrame) {
     var content = normalizeText(textFrame.contents);
     if (!content.length) {
@@ -472,9 +1005,7 @@
       if (dup.kind === TextType.AREATEXT) {
         try {
           dup.convertAreaObjectToPointObject();
-        } catch (convErr) {
-          // fallback below if convert is unavailable
-        }
+        } catch (convErr) {}
       }
 
       if (normalizeText(dup.contents) !== content || dup.kind === TextType.AREATEXT) {
@@ -517,16 +1048,12 @@
     }
   }
 
-  /**
-   * @param {boolean} fast  If true, only clip/wrap check (no duplicate measure).
-   */
   function textDoesNotFit(textFrame, fast) {
     var content = normalizeText(textFrame.contents);
     if (!content.length) {
       return false;
     }
 
-    // 1) real area-text state (wrap / clipped)
     if (hasClippedOrWrapped(textFrame)) {
       return true;
     }
@@ -535,7 +1062,6 @@
       return false;
     }
 
-    // 2) full single-line width vs effective frame width (with safety margin)
     var textW = measureTextWidth(textFrame);
     var frameW = getEffectiveFrameWidth(textFrame);
     if (textW < 0) {
@@ -568,12 +1094,10 @@
 
     setFontSize(textFrame, hi);
     app.redraw();
-    // Full check once: if already fits at design size, skip search
     if (!textDoesNotFit(textFrame, false)) {
       return hi;
     }
 
-    // Binary search with fast clip/wrap only (no measureTextWidth)
     for (var iter = 0; iter < 16; iter++) {
       var mid = (lo + hi) / 2;
       setFontSize(textFrame, mid);
@@ -593,20 +1117,17 @@
     setFontSize(textFrame, best);
     app.redraw();
 
-    // Coarse then fine guard (clip/wrap only)
     best = shrinkUntilFits(textFrame, best, 0.25, 40, true);
     best = shrinkUntilFits(textFrame, best, 0.1, 20, true);
 
     setFontSize(textFrame, best);
     app.redraw();
 
-    // Final verify with width measure (punctuation / tight fit cases)
     best = shrinkUntilFits(textFrame, best, 0.1, 30, false);
 
     setFontSize(textFrame, best);
     app.redraw();
 
-    // small extra shrink so text is not flush against the edge
     if (!textDoesNotFit(textFrame, false) && best > 0.2) {
       best -= 0.2;
       setFontSize(textFrame, best);
@@ -623,7 +1144,6 @@
 
   function sanitizeFileName(name) {
     var s = String(name || "");
-    // Keep spaces; strip only illegal filename characters
     s = s.replace(/[\r\n\t]+/g, " ");
     s = s.replace(/[\/\\:\*\?"<>\|]/g, "");
     s = s.replace(/\s+/g, " ");
@@ -640,4 +1160,39 @@
     used[key]++;
     return baseName + "_" + used[key];
   }
+
+  // -------------------------------------------------------------------------
+  // Main (after all function declarations — safer in ExtendScript)
+  // -------------------------------------------------------------------------
+
+  if (app.documents.length === 0) {
+    alert("No document is open.");
+    return;
+  }
+
+  doc = app.activeDocument;
+
+  if (!doc.dataSets || doc.dataSets.length === 0) {
+    alert("This document has no Data Sets.\nImport Variables + Data Sets first.");
+    return;
+  }
+
+  // Snapshot selection NOW (before any dialog steals focus)
+  fitTargets = snapshotFitTargets(doc);
+
+  var prefs = loadPrefs();
+  var settings = showDialog(prefs, fitTargets.length);
+  if (!settings) {
+    return;
+  }
+
+  if (settings.autoFit && fitTargets.length === 0) {
+    alert(
+      "Auto Fit was requested, but no Area Type frames were captured.\n" +
+        "Select Area Type frames (not Point Type) with the Selection tool, then run the script again."
+    );
+    return;
+  }
+
+  runExport(settings, settings.autoFit ? fitTargets : []);
 })();
