@@ -15,7 +15,7 @@
  * Output filename = Data Set name (spaces kept; rename workaround after export).
  *
  * Notes:
- * - JPG/PNG: PPI via scale (100% = 72ppi) / ImageCapture resolution
+ * - JPG/PNG: PPI via scale (100% = 72ppi); PNG falls back to ImageCapture if needed
  * - PDF: vector; PPI is unused
  * - maxFontSize per text frame = font size when the script starts
  */
@@ -287,27 +287,26 @@
   }
 
   function exportPng(document, folder, baseName, ppi) {
-    var abIndex = document.artboards.getActiveArtboardIndex();
-    var rect = document.artboards[abIndex].artboardRect;
-
-    var opts = new ImageCaptureOptions();
-    opts.resolution = ppi;
-    opts.antiAliasing = true;
-    opts.transparency = false;
-    opts.matte = true;
+    var scale = (ppi / 72) * 100;
+    var pngOpts = new ExportOptionsPNG24();
+    pngOpts.antiAliasing = true;
+    pngOpts.transparency = false;
+    pngOpts.artBoardClipping = ARTBOARD_CLIPPING;
+    pngOpts.horizontalScale = scale;
+    pngOpts.verticalScale = scale;
 
     exportWithFinalName(folder, baseName, "png", function (tempFile) {
       try {
-        document.imageCapture(tempFile, rect, opts);
-      } catch (imgErr) {
-        var scale = (ppi / 72) * 100;
-        var pngOpts = new ExportOptionsPNG24();
-        pngOpts.antiAliasing = true;
-        pngOpts.transparency = false;
-        pngOpts.artBoardClipping = ARTBOARD_CLIPPING;
-        pngOpts.horizontalScale = scale;
-        pngOpts.verticalScale = scale;
         document.exportFile(tempFile, ExportType.PNG24, pngOpts);
+      } catch (exportErr) {
+        var abIndex = document.artboards.getActiveArtboardIndex();
+        var rect = document.artboards[abIndex].artboardRect;
+        var opts = new ImageCaptureOptions();
+        opts.resolution = ppi;
+        opts.antiAliasing = true;
+        opts.transparency = false;
+        opts.matte = true;
+        document.imageCapture(tempFile, rect, opts);
       }
     });
   }
@@ -355,14 +354,19 @@
   function setFontSize(textFrame, size) {
     try {
       textFrame.textRange.characterAttributes.size = size;
+      return;
     } catch (e0) {}
-    var chars = textFrame.characters;
-    var n = chars.length;
-    for (var c = 0; c < n; c++) {
-      try {
-        chars[c].characterAttributes.size = size;
-      } catch (e2) {}
-    }
+
+    // Fallback only if whole-range set failed
+    try {
+      var chars = textFrame.characters;
+      var n = chars.length;
+      for (var c = 0; c < n; c++) {
+        try {
+          chars[c].characterAttributes.size = size;
+        } catch (e2) {}
+      }
+    } catch (e1) {}
   }
 
   function disableHyphenation(textFrame) {
@@ -497,7 +501,6 @@
       }
 
       disableHyphenation(dup);
-      app.redraw();
 
       var b = dup.geometricBounds;
       var w = b[2] - b[0];
@@ -514,18 +517,22 @@
     }
   }
 
-  function textDoesNotFit(textFrame) {
+  /**
+   * @param {boolean} fast  If true, only clip/wrap check (no duplicate measure).
+   */
+  function textDoesNotFit(textFrame, fast) {
     var content = normalizeText(textFrame.contents);
     if (!content.length) {
       return false;
     }
 
-    disableHyphenation(textFrame);
-    app.redraw();
-
     // 1) real area-text state (wrap / clipped)
     if (hasClippedOrWrapped(textFrame)) {
       return true;
+    }
+
+    if (fast) {
+      return false;
     }
 
     // 2) full single-line width vs effective frame width (with safety margin)
@@ -539,6 +546,19 @@
     return textW > frameW - safety;
   }
 
+  function shrinkUntilFits(textFrame, best, step, maxSteps, fast) {
+    var guard = 0;
+    while (textDoesNotFit(textFrame, fast) && best > 0.1 && guard < maxSteps) {
+      best -= step;
+      if (best < 0.1) {
+        best = 0.1;
+      }
+      setFontSize(textFrame, best);
+      guard++;
+    }
+    return best;
+  }
+
   function fitTextToFrame(textFrame, maxSize) {
     disableHyphenation(textFrame);
 
@@ -548,16 +568,17 @@
 
     setFontSize(textFrame, hi);
     app.redraw();
-    if (!textDoesNotFit(textFrame)) {
+    // Full check once: if already fits at design size, skip search
+    if (!textDoesNotFit(textFrame, false)) {
       return hi;
     }
 
-    for (var iter = 0; iter < 36; iter++) {
+    // Binary search with fast clip/wrap only (no measureTextWidth)
+    for (var iter = 0; iter < 16; iter++) {
       var mid = (lo + hi) / 2;
       setFontSize(textFrame, mid);
-      app.redraw();
 
-      if (!textDoesNotFit(textFrame)) {
+      if (!textDoesNotFit(textFrame, true)) {
         best = mid;
         lo = mid;
       } else {
@@ -572,24 +593,25 @@
     setFontSize(textFrame, best);
     app.redraw();
 
-    // safety: shrink until the area text truly does not clip/wrap
-    var guard = 0;
-    while (textDoesNotFit(textFrame) && best > 0.1 && guard < 400) {
-      best -= 0.1;
-      if (best < 0.1) {
-        best = 0.1;
-      }
-      setFontSize(textFrame, best);
-      app.redraw();
-      guard++;
-    }
+    // Coarse then fine guard (clip/wrap only)
+    best = shrinkUntilFits(textFrame, best, 0.25, 40, true);
+    best = shrinkUntilFits(textFrame, best, 0.1, 20, true);
+
+    setFontSize(textFrame, best);
+    app.redraw();
+
+    // Final verify with width measure (punctuation / tight fit cases)
+    best = shrinkUntilFits(textFrame, best, 0.1, 30, false);
+
+    setFontSize(textFrame, best);
+    app.redraw();
 
     // small extra shrink so text is not flush against the edge
-    if (!textDoesNotFit(textFrame) && best > 0.2) {
+    if (!textDoesNotFit(textFrame, false) && best > 0.2) {
       best -= 0.2;
       setFontSize(textFrame, best);
       app.redraw();
-      if (textDoesNotFit(textFrame)) {
+      if (textDoesNotFit(textFrame, false)) {
         best += 0.2;
         setFontSize(textFrame, best);
         app.redraw();
